@@ -1,48 +1,111 @@
-name: Sync Upstream and Patch Auth
-
-on:
-  schedule:
-    - cron: '0 3 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Sync with upstream and disable bitchordAuth
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-
-          git remote add upstream https://github.com/juanjoblol/bitchord-hires-addon.git
-          git fetch upstream HEAD
-          git checkout FETCH_HEAD -- . ':!.github'
-
-          node -e '
-            const fs = require("fs");
-            let code = fs.readFileSync("api/index.js", "utf8");
-            code = code.replace(/bitchordAuth:\s*true/g, "bitchordAuth: false");
-            code = code.replace(/checkValidLossless:\s*1/g, "checkValidLossless: 0");
-            code = code.replace(/const auth = await bitchord\.verifyRequest\(req\);[\s\S]*?return json\(res, rejection\.status, rejection\.body, rejection\.headers\);\s*\}/g, "// auth bypassed");
-            if (code.includes("bitchord.verifyRequest(")) {
-              console.error("Error: verifyRequest() still remains in api/index.js. Upstream structure may have changed.");
-              process.exit(1);
-            }
-            fs.writeFileSync("api/index.js", code);
-          '
-
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "chore: sync upstream and disable bitchordAuth"
-          git push origin "HEAD:${{ github.ref_name }}"
+import { searchAll, resolveStream, health } from '../lib/router.js';
+import { createBitChordAuth } from '../lib/bitchord-addon-auth.mjs';
+const bitchord = createBitChordAuth({
+    hosts: ['bitchord-hires-addon.de.deplexo.com', 'bitchord-hires-addon.vercel.app'],
+});
+const MANIFEST = {
+    id: 'dev.akira.bitchord-hires',
+    name: 'juanjob hi res',
+    version: '1.2.2',
+    description: 'Multi-source lossless addon: Qobuz hi-res, Tidal, Monochrome, Netease, Deezer catalogue. Automatic failover.',
+    resources: ['search', 'stream'],
+    bitchordAuth: false,
+    checkValidLossless: 0,
+    allowDownloads: 1,
+    settings: [
+        {
+            key: 'quality',
+            type: 'select',
+            default: 'lossless',
+            options: [
+                { label: 'Lossless (FLAC, up to 24/192)', value: 'lossless' },
+                { label: 'High (FLAC, up to 24/96)', value: 'high' },
+                { label: 'Low (data saver)', value: 'low' },
+            ],
+        },
+        {
+            key: 'atmos',
+            type: 'select',
+            default: 'stereo',
+            options: [
+                { label: 'Stereo only', value: 'stereo' },
+                { label: 'Dolby Atmos when available', value: 'auto' },
+            ],
+        },
+    ],
+};
+function json(res, status, body, extraHeaders = {}) {
+    const headers = {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, X-BitChord-Token, X-BitChord-Proof',
+        'Access-Control-Expose-Headers': 'WWW-Authenticate',
+    };
+    for (const [key, value] of Object.entries(extraHeaders)) {
+        const existing = Object.keys(headers).find((name) => name.toLowerCase() === key.toLowerCase());
+        if (existing)
+            delete headers[existing];
+        headers[key] = value;
+    }
+    res.writeHead(status, headers);
+    res.end(typeof body === 'string' ? body : JSON.stringify(body));
+}
+export default async function handler(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    let path = url.pathname.replace(/\/+$/, '') || '/';
+    if (path === '/api/index.js' || path === '/api/index') {
+        const original = url.searchParams.get('path');
+        if (original !== null) {
+            path = ('/' + original).replace(/\/+$/, '') || '/';
+        }
+    }
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, X-BitChord-Token, X-BitChord-Proof',
+            'Access-Control-Max-Age': '86400',
+        });
+        return res.end();
+    }
+    if (req.method !== 'GET') {
+        return json(res, 405, { error: 'method not allowed' }, { Allow: 'GET, OPTIONS' });
+    }
+    if (path === '/' || path === '/manifest.json') {
+        return json(res, 200, MANIFEST);
+    }
+    // auth bypassed
+    if (path === '/health') {
+        try {
+            const report = await health();
+            return json(res, 200, report);
+        }
+        catch (err) {
+            return json(res, 500, { ok: false, error: String(err?.message || err) });
+        }
+    }
+    if (path === '/search') {
+        const query = url.searchParams.get('q') || '';
+        if (!query.trim())
+            return json(res, 200, { tracks: [] });
+        try {
+            const { tracks, perSource } = await searchAll(query, url.searchParams.get('quality'));
+            return json(res, 200, { tracks }, { 'X-Addon-Sources': encodeURIComponent(JSON.stringify(perSource)) });
+        }
+        catch (err) {
+            return json(res, 200, { tracks: [], error: String(err?.message || err) });
+        }
+    }
+    if (path.startsWith('/stream/')) {
+        const id = decodeURIComponent(path.slice('/stream/'.length));
+        if (!id)
+            return json(res, 404, { error: 'missing id' });
+        const stream = await resolveStream(id, url.searchParams.get('quality'));
+        if (!stream)
+            return json(res, 404, { error: 'not available in this addon' });
+        return json(res, 200, stream);
+    }
+    return json(res, 404, { error: 'not found' });
+}
